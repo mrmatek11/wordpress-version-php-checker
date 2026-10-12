@@ -25,18 +25,30 @@ import argparse
 import html as html_mod
 import json
 import os
+import random
 import re
+import string
 import sys
 import urllib.parse
 
 import wpcheck
 import vulnfeed
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vulnerabilities.json")
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+# Latest WordPress branch known at build time (used only for an "outdated" hint).
+LATEST_WP = (6, 7)
+
+# End-of-life status of PHP branches (as of 2026). "eol" = no security support.
+PHP_EOL = {
+    (5,): "eol", (7, 0): "eol", (7, 1): "eol", (7, 2): "eol", (7, 3): "eol",
+    (7, 4): "eol", (8, 0): "eol", (8, 1): "eol",
+    (8, 2): "security-only", (8, 3): "supported", (8, 4): "supported",
+}
 
 # ---------------------------------------------------------------------------
 # version helpers
@@ -161,74 +173,195 @@ EXPOSED_FILES = [
     ("wp-config.php.save", "critical", "Backup of wp-config.php may expose DB credentials"),
     ("wp-config.php~", "critical", "Editor backup of wp-config.php may expose DB credentials"),
     ("wp-config.php.old", "critical", "Backup of wp-config.php may expose DB credentials"),
+    ("wp-config.php.orig", "critical", "Backup of wp-config.php may expose DB credentials"),
+    ("wp-config.php.txt", "critical", "Backup of wp-config.php may expose DB credentials"),
+    ("wp-config.php.swp", "critical", "Vim swap file of wp-config.php may expose DB credentials"),
     (".env", "critical", "Environment file may expose secrets and credentials"),
     (".git/config", "high", "Exposed .git directory can leak full source code"),
+    (".svn/entries", "high", "Exposed .svn directory can leak source code"),
+    (".DS_Store", "low", "macOS .DS_Store can leak file names"),
     ("debug.log", "medium", "Debug log may expose paths and errors"),
     ("wp-content/debug.log", "medium", "WordPress debug log may expose paths and errors"),
     ("readme.html", "low", "readme.html reveals the exact WordPress version"),
-    ("wp-content/uploads/", "low", "Uploads directory listing may be enabled"),
+    ("license.txt", "info", "license.txt confirms WordPress and can hint at the version"),
+]
+
+# Common backup/archive names dropped in the web root.
+BACKUP_FILES = [
+    "backup.zip", "backup.tar.gz", "backup.sql", "database.sql", "db.sql",
+    "dump.sql", "wordpress.sql", "site.zip", "www.zip", "wp-content.zip",
+    "backup.tar", "latest.zip", "old.zip", "public_html.zip",
+]
+
+DIR_LISTING_PATHS = [
+    ("wp-content/uploads/", "low", "Uploads directory listing is enabled"),
+    ("wp-content/plugins/", "medium", "Plugins directory listing is enabled (eases enumeration)"),
+    ("wp-content/themes/", "medium", "Themes directory listing is enabled (eases enumeration)"),
+    ("wp-content/", "low", "wp-content directory listing is enabled"),
+    ("wp-includes/", "low", "wp-includes directory listing is enabled"),
 ]
 
 
-def check_misconfig(base, fetcher):
-    findings = []
+def _f(check, severity, title, detail, where):
+    return {"check": check, "severity": severity, "title": title,
+            "detail": detail, "location": where}
 
-    for path, severity, desc in EXPOSED_FILES:
-        resp = fetcher.get(urllib.parse.urljoin(base, path))
-        if resp is None:
-            continue
-        st, _, body, _ = resp
-        if st != 200 or not body:
-            continue
-        if path.endswith("/"):
-            if re.search(r"<title>\s*Index of", body, re.I) or "Parent Directory" in body:
-                findings.append(_f("directory-listing", severity,
-                                   f"Directory listing enabled: /{path}", desc, path))
-            continue
-        # avoid counting a soft-404 HTML page as a hit
-        low = body.lower()
-        if path == "readme.html" and "wordpress" not in low:
-            continue
-        if path == ".git/config" and "[core]" not in low:
-            continue
-        if path == ".env" and "<html" in low[:200]:
-            continue
-        findings.append(_f("exposed-file", severity,
-                           f"Accessible file: /{path}", desc, path))
 
-    # user enumeration via REST API
+def make_baseline(base, fetcher):
+    """Signatures of responses for paths that definitely do not exist, so we can
+    tell a real file from a site that returns 200 for everything (soft 404)."""
+    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=24))
+    sigs = []
+    for suffix in (f"zz{rand}/", f"zz{rand}.txt"):
+        resp = fetcher.get(urllib.parse.urljoin(base, suffix))
+        if resp is not None:
+            st, _, body, _ = resp
+            sigs.append((st, len(body or "")))
+    return sigs
+
+
+def _is_real(resp, baseline, status=200):
+    """True if resp looks like a genuine resource, not a soft-404 echo."""
+    if resp is None:
+        return False
+    st, _, body, _ = resp
+    if st != status or not body:
+        return False
+    blen = len(body)
+    for bst, bl in baseline:
+        if bst == status and abs(bl - blen) < 48:
+            return False
+    return True
+
+
+def _is_listing(body):
+    return bool(re.search(r"<title>\s*Index of\b", body, re.I)
+                or "Parent Directory" in body
+                or re.search(r'<a href="[^"]+">\s*</a>', body))
+
+
+def enum_users(base, fetcher):
+    """Discover login names via the REST API and author-ID scanning. Read-only."""
+    users = {}
+
     resp = fetcher.get(urllib.parse.urljoin(base, "wp-json/wp/v2/users"))
     if resp is not None:
         st, _, body, _ = resp
         if st == 200 and body.strip().startswith("["):
             try:
-                users = json.loads(body)
+                for u in json.loads(body):
+                    if isinstance(u, dict) and (u.get("slug") or u.get("name")):
+                        users[u.get("slug") or u["name"]] = "REST API"
             except ValueError:
-                users = []
-            names = [u.get("slug") or u.get("name") for u in users if isinstance(u, dict)]
-            names = [n for n in names if n]
-            if names:
-                findings.append(_f("user-enumeration", "medium",
-                                   "User enumeration possible via REST API",
-                                   "Login names are exposed at /wp-json/wp/v2/users: "
-                                   + ", ".join(names[:10]) + ("..." if len(names) > 10 else ""),
-                                   "wp-json/wp/v2/users"))
+                pass
+
+    # /?author=N redirects to /author/<login>/
+    for n in range(1, 6):
+        resp = fetcher.get(urllib.parse.urljoin(base, f"?author={n}"))
+        if resp is None:
+            continue
+        st, _, body, final = resp
+        m = re.search(r"/author/([^/?#]+)/?", final or "")
+        if not m and body:
+            m = re.search(r'<body[^>]*class="[^"]*\bauthor-([a-z0-9_-]+)\b', body, re.I)
+        if m:
+            users.setdefault(urllib.parse.unquote(m.group(1)), "author ID scan")
+
+    return users
+
+
+def check_misconfig(base, fetcher, baseline, wp_version=None, php_version=None,
+                    home_resp=None):
+    findings = []
+
+    for path, severity, desc in EXPOSED_FILES:
+        resp = fetcher.get(urllib.parse.urljoin(base, path))
+        if not _is_real(resp, baseline):
+            continue
+        low = resp[2].lower()
+        if path == "readme.html" and "wordpress" not in low:
+            continue
+        if path == "license.txt" and "wordpress" not in low:
+            continue
+        if path == ".git/config" and "[core]" not in low:
+            continue
+        if path == ".svn/entries" and "dir" not in low and not low.strip().isdigit():
+            continue
+        if path.endswith(".php.swp") and "<?php" not in low and "db_" not in low:
+            pass  # swap files are binary-ish; presence alone is the finding
+        if ".env" == path and "<html" in low[:200]:
+            continue
+        findings.append(_f("exposed-file", severity, f"Accessible file: /{path}", desc, path))
+
+    # backup/archive files in the web root
+    for name in BACKUP_FILES:
+        resp = fetcher.get(urllib.parse.urljoin(base, name))
+        if _is_real(resp, baseline):
+            low = resp[2][:200].lower()
+            if "<html" in low or "<!doctype" in low:
+                continue  # soft-404 HTML page
+            findings.append(_f("exposed-backup", "high",
+                               f"Possible backup archive: /{name}",
+                               "A site backup in the web root may expose the database, "
+                               "source code and credentials. Verify and remove it.", name))
+
+    # directory listings
+    for path, severity, desc in DIR_LISTING_PATHS:
+        resp = fetcher.get(urllib.parse.urljoin(base, path))
+        if resp is None:
+            continue
+        st, _, body, _ = resp
+        if st == 200 and body and _is_listing(body):
+            findings.append(_f("directory-listing", severity,
+                               f"Directory listing enabled: /{path}", desc, path))
+
+    # installer reachable (fresh-install takeover)
+    for path in ("wp-admin/install.php", "wp-admin/setup-config.php"):
+        resp = fetcher.get(urllib.parse.urljoin(base, path))
+        if resp is None:
+            continue
+        st, _, body, _ = resp
+        low = (body or "").lower()
+        if st == 200 and low and "already installed" not in low and (
+                "wp-submit" in low or "setup-config" in low or "step=" in low
+                or "installation" in low):
+            findings.append(_f("installer-exposed", "critical",
+                               f"WordPress installer reachable: /{path}",
+                               "If the site is not yet installed, anyone can take it over. "
+                               "Block this endpoint.", path))
+
+    # user enumeration
+    users = enum_users(base, fetcher)
+    if users:
+        names = list(users)
+        findings.append(_f("user-enumeration", "medium",
+                           "User enumeration possible",
+                           "Login names exposed (" + ", ".join(sorted(set(v for v in users.values())))
+                           + "): " + ", ".join(names[:10]) + ("..." if len(names) > 10 else ""),
+                           "wp-json/wp/v2/users, ?author=N"))
 
     # XML-RPC enabled
     resp = fetcher.get(urllib.parse.urljoin(base, "xmlrpc.php"))
-    if resp is not None:
-        st, _, body, _ = resp
-        if "XML-RPC server accepts POST requests only" in (body or ""):
-            findings.append(_f("xmlrpc-enabled", "low",
-                               "XML-RPC endpoint is enabled",
-                               "xmlrpc.php is reachable. If unused, disabling it reduces the "
-                               "attack surface (login amplification, pingback abuse).",
-                               "xmlrpc.php"))
+    if resp is not None and "XML-RPC server accepts POST requests only" in (resp[2] or ""):
+        findings.append(_f("xmlrpc-enabled", "low", "XML-RPC endpoint is enabled",
+                           "xmlrpc.php is reachable. If unused, disabling it reduces the attack "
+                           "surface (login amplification, pingback abuse).", "xmlrpc.php"))
 
-    # missing security headers (checked on the home page)
-    home = fetcher.get(base)
+    # version / software disclosure + security headers (home page)
+    home = home_resp or fetcher.get(base)
     if home is not None:
-        _, headers, _, _ = home
+        _, headers, body, _ = home
+        xpb = headers.get("X-Powered-By")
+        if xpb and re.search(r"php", xpb, re.I):
+            findings.append(_f("version-disclosure", "info",
+                               "PHP version disclosed in headers",
+                               f"X-Powered-By: {xpb.strip()} — hides nothing from an attacker; "
+                               "consider removing expose_php.", base))
+        if body and re.search(r'name=["\']generator["\'][^>]+WordPress\s+\d', body, re.I):
+            findings.append(_f("version-disclosure", "info",
+                               "WordPress version disclosed in page",
+                               "The <meta generator> tag reveals the exact WordPress version.",
+                               base))
         present = {k.lower() for k in headers.keys()}
         wanted = {
             "content-security-policy": "Content-Security-Policy",
@@ -243,12 +376,42 @@ def check_misconfig(base, fetcher):
                                "Missing recommended security headers",
                                "Not set: " + ", ".join(missing), base))
 
+    # not served over HTTPS
+    if base.startswith("http://"):
+        findings.append(_f("no-https", "medium", "Site is served over plain HTTP",
+                           "Traffic (including logins) is unencrypted. Enable HTTPS and "
+                           "redirect HTTP to it.", base))
+
+    # outdated / EOL software
+    findings += check_software(wp_version, php_version, base)
+
     return findings
 
 
-def _f(check, severity, title, detail, where):
-    return {"check": check, "severity": severity, "title": title,
-            "detail": detail, "location": where}
+def check_software(wp_version, php_version, base):
+    findings = []
+    wv = parse_version(wp_version)
+    if wv:
+        mm = wv[:2]
+        if mm < LATEST_WP:
+            sev = "medium" if mm[0] < LATEST_WP[0] else "low"
+            findings.append(_f("outdated-core", sev,
+                               f"WordPress {wp_version} may be outdated",
+                               f"Latest known branch at build time is {LATEST_WP[0]}.{LATEST_WP[1]}. "
+                               "Confirm against wordpress.org and update.", base))
+    pv = parse_version(php_version)
+    if pv:
+        status = PHP_EOL.get(pv[:2]) or PHP_EOL.get(pv[:1])
+        if status == "eol":
+            findings.append(_f("php-eol", "high",
+                               f"PHP {php_version} is end-of-life",
+                               "This PHP branch no longer receives security fixes. Upgrade to a "
+                               "supported version.", base))
+        elif status == "security-only":
+            findings.append(_f("php-eol", "low",
+                               f"PHP {php_version} is in security-only support",
+                               "This branch is nearing end-of-life; plan an upgrade.", base))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +521,12 @@ def audit_site(url, fetcher, db, do_config=True, plugin_wordlist=None, theme_wor
     report["plugins"] = enumerate_plugins(base, fetcher, html_texts, plugin_wordlist)
     report["themes"] = enumerate_themes(base, fetcher, html_texts, theme_wordlist)
     if do_config:
-        report["misconfigurations"] = check_misconfig(base, fetcher)
+        baseline = make_baseline(base, fetcher)
+        report["misconfigurations"] = check_misconfig(
+            base, fetcher, baseline,
+            wp_version=report["wordpress_version"],
+            php_version=report["php_version"],
+            home_resp=home)
     report["vulnerabilities"] = match_vulns(
         db, report["wordpress_version"], report["plugins"], report["themes"])
 

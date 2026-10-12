@@ -126,7 +126,15 @@ What it does:
 
 - **Version detection** — WordPress + PHP, reusing `wpcheck.py`.
 - **Plugin & theme enumeration** — finds slugs referenced in the page, then reads each plugin's `readme.txt` (`Stable tag:`) and each theme's `style.css` (`Version:`) for the installed version. With `-e / --enumerate` it also probes bundled lists of popular plugins/themes, so it finds components that aren't referenced anywhere in the HTML (aggressive hits are marked `*`). Most real-world WordPress vulnerabilities live in plugins, so this is the big one.
-- **Misconfiguration / exposure checks** — accessible `wp-config.php` backups, `.env`, exposed `.git`, `debug.log`, directory listing on `/wp-content/uploads/`, user enumeration via `/wp-json/wp/v2/users`, XML-RPC enabled, `readme.html`, and missing security headers (CSP, HSTS, X-Frame-Options, …).
+- **Weakness / exposure scanning** — a soft-404 baseline is measured first (so sites that return `200` for everything don't produce false positives), then it checks for:
+  - exposed `wp-config.php` backups (`.bak`, `.save`, `~`, `.old`, `.orig`, `.txt`, `.swp`), `.env`, `.git` / `.svn`, `debug.log`, `.DS_Store`
+  - backup archives in the web root (`backup.zip`, `*.sql`, `wp-content.zip`, …)
+  - directory listing on `uploads/`, `plugins/`, `themes/`, `wp-content/`, `wp-includes/`
+  - a reachable installer (`wp-admin/install.php`) — fresh-install takeover
+  - user enumeration via the REST API **and** `?author=N` ID scanning
+  - XML-RPC enabled, missing security headers (CSP, HSTS, X-Frame-Options, …)
+  - plain-HTTP (no TLS), and PHP/WordPress version disclosure
+  - **outdated WordPress** and **end-of-life PHP** versions
 - **Vulnerability matching** — compares each detected version against a database and lists matching CVEs with severity and the version they were fixed in. Works offline against `data/vulnerabilities.json`, or against a **live source** with `--online`.
 
 ### Aggressive enumeration
