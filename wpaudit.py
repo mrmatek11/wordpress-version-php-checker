@@ -30,8 +30,9 @@ import sys
 import urllib.parse
 
 import wpcheck
+import vulnfeed
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vulnerabilities.json")
 
@@ -87,44 +88,67 @@ def _collect_slugs(regex, *texts):
     return seen
 
 
-def enumerate_plugins(base, fetcher, html_texts):
-    slugs = _collect_slugs(PLUGIN_PATH_RE, *html_texts)
+def _plugin_readme(base, fetcher, slug):
+    """Return (version, source, present) by reading the plugin's readme.txt."""
+    for fname in ("readme.txt", "README.txt", "Readme.txt"):
+        resp = fetcher.get(urllib.parse.urljoin(base, f"wp-content/plugins/{slug}/{fname}"))
+        if resp is None:
+            continue
+        st, _, body, _ = resp
+        if st >= 400 or not body:
+            continue
+        # a genuine plugin readme contains a header section
+        present = ("stable tag" in body.lower() or "=== " in body or "== description ==" in body.lower())
+        m = STABLE_TAG_RE.search(body) or README_VERSION_RE.search(body)
+        version = m.group(1) if (m and m.group(1).lower() != "trunk") else None
+        return version, f"{fname} Stable tag" if version else f"{fname}", present
+    return None, "referenced in page", False
+
+
+def _theme_style(base, fetcher, slug):
+    resp = fetcher.get(urllib.parse.urljoin(base, f"wp-content/themes/{slug}/style.css"))
+    if resp is None:
+        return None, "referenced in page", False
+    st, _, body, _ = resp
+    if st >= 400 or not body:
+        return None, "referenced in page", False
+    present = "theme name:" in body[:4000].lower()
+    m = STYLE_VERSION_RE.search(body[:4000])
+    version = m.group(1).strip() if m else None
+    return version, "style.css Version" if version else "style.css", present
+
+
+def enumerate_plugins(base, fetcher, html_texts, wordlist=None):
+    referenced = _collect_slugs(PLUGIN_PATH_RE, *html_texts)
     plugins = []
-    for slug in slugs:
-        version = None
-        source = "referenced in page"
-        # readme.txt is the canonical place for a plugin version
-        for fname in ("readme.txt", "README.txt", "Readme.txt"):
-            resp = fetcher.get(urllib.parse.urljoin(base, f"wp-content/plugins/{slug}/{fname}"))
-            if resp is None:
+    for slug in referenced:
+        version, source, _ = _plugin_readme(base, fetcher, slug)
+        plugins.append({"slug": slug, "version": version, "source": source, "detection": "passive"})
+    if wordlist:
+        known = {p["slug"] for p in plugins}
+        for slug in wordlist:
+            if slug in known:
                 continue
-            st, _, body, _ = resp
-            if st >= 400 or not body:
-                continue
-            m = STABLE_TAG_RE.search(body) or README_VERSION_RE.search(body)
-            if m and m.group(1).lower() != "trunk":
-                version = m.group(1)
-                source = f"{fname} Stable tag"
-            break
-        plugins.append({"slug": slug, "version": version, "source": source})
+            version, source, present = _plugin_readme(base, fetcher, slug)
+            if present:  # only report wordlist hits we can actually confirm
+                plugins.append({"slug": slug, "version": version, "source": source, "detection": "aggressive"})
     return plugins
 
 
-def enumerate_themes(base, fetcher, html_texts):
-    slugs = _collect_slugs(THEME_PATH_RE, *html_texts)
+def enumerate_themes(base, fetcher, html_texts, wordlist=None):
+    referenced = _collect_slugs(THEME_PATH_RE, *html_texts)
     themes = []
-    for slug in slugs:
-        version = None
-        source = "referenced in page"
-        resp = fetcher.get(urllib.parse.urljoin(base, f"wp-content/themes/{slug}/style.css"))
-        if resp is not None:
-            st, _, body, _ = resp
-            if st < 400 and body:
-                m = STYLE_VERSION_RE.search(body[:4000])
-                if m:
-                    version = m.group(1).strip()
-                    source = "style.css Version"
-        themes.append({"slug": slug, "version": version, "source": source})
+    for slug in referenced:
+        version, source, _ = _theme_style(base, fetcher, slug)
+        themes.append({"slug": slug, "version": version, "source": source, "detection": "passive"})
+    if wordlist:
+        known = {t["slug"] for t in themes}
+        for slug in wordlist:
+            if slug in known:
+                continue
+            version, source, present = _theme_style(base, fetcher, slug)
+            if present:
+                themes.append({"slug": slug, "version": version, "source": source, "detection": "aggressive"})
     return themes
 
 
@@ -298,7 +322,7 @@ def match_vulns(db, wp_version, plugins, themes):
 # audit driver
 # ---------------------------------------------------------------------------
 
-def audit_site(url, fetcher, db, do_config=True):
+def audit_site(url, fetcher, db, do_config=True, plugin_wordlist=None, theme_wordlist=None):
     base = wpcheck.normalize_url(url)
     report = {
         "url": base,
@@ -331,14 +355,62 @@ def audit_site(url, fetcher, db, do_config=True):
     login = fetcher.get(urllib.parse.urljoin(base, "wp-login.php"))
     html_texts = [home[2] if home else "", login[2] if login else ""]
 
-    report["plugins"] = enumerate_plugins(base, fetcher, html_texts)
-    report["themes"] = enumerate_themes(base, fetcher, html_texts)
+    report["plugins"] = enumerate_plugins(base, fetcher, html_texts, plugin_wordlist)
+    report["themes"] = enumerate_themes(base, fetcher, html_texts, theme_wordlist)
     if do_config:
         report["misconfigurations"] = check_misconfig(base, fetcher)
     report["vulnerabilities"] = match_vulns(
         db, report["wordpress_version"], report["plugins"], report["themes"])
 
     return report
+
+
+def rematch(report, db):
+    report["vulnerabilities"] = match_vulns(
+        db, report["wordpress_version"], report["plugins"], report["themes"])
+
+
+def enrich_db_online(db, source, reports, cache_path=None):
+    """Query an online source for every component seen across reports and merge
+    the results into `db` (deduped by id). Returns number of entries added."""
+    added = 0
+
+    def merge(bucket, entries):
+        nonlocal added
+        existing = {e.get("id") for e in bucket if e.get("id")}
+        for e in entries or []:
+            if e.get("id") and e["id"] in existing:
+                continue
+            bucket.append(e)
+            existing.add(e.get("id"))
+            added += 1
+
+    cores, plugins, themes = set(), set(), set()
+    for r in reports:
+        if r.get("wordpress_version"):
+            cores.add(r["wordpress_version"])
+        for p in r.get("plugins", []):
+            if p.get("version"):
+                plugins.add(p["slug"])
+        for t in r.get("themes", []):
+            if t.get("version"):
+                themes.add(t["slug"])
+
+    for v in sorted(cores):
+        merge(db["core"], source.lookup_core(v))
+    for slug in sorted(plugins):
+        merge(db["plugins"].setdefault(slug, []), source.lookup_plugin(slug))
+    for slug in sorted(themes):
+        merge(db["themes"].setdefault(slug, []), source.lookup_theme(slug))
+
+    if cache_path:
+        try:
+            db.setdefault("_meta", {})["source"] = source.name
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                json.dump(db, fh, indent=2)
+        except OSError:
+            pass
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +437,17 @@ def print_text(r, on):
     if not r["php_version"] and r["php_min_required_by_wp"]:
         print(f"              (WP requires PHP >= {r['php_min_required_by_wp']})")
 
+    def _mark(x):
+        return " *" if x.get("detection") == "aggressive" else ""
+
     if r["plugins"]:
         print(b("  Plugins:"))
         for p in r["plugins"]:
-            print(f"    - {p['slug']} {p['version'] or '(version unknown)'}")
+            print(f"    - {p['slug']} {p['version'] or '(version unknown)'}{_mark(p)}")
     if r["themes"]:
         print(b("  Themes:"))
         for t in r["themes"]:
-            print(f"    - {t['slug']} {t['version'] or '(version unknown)'}")
+            print(f"    - {t['slug']} {t['version'] or '(version unknown)'}{_mark(t)}")
 
     if r["misconfigurations"]:
         print(b("  Misconfigurations:"))
@@ -495,6 +570,24 @@ vulnerability database. Version matches are indicative, not proof of exploitabil
 # cli
 # ---------------------------------------------------------------------------
 
+def _load_wordlist(path):
+    slugs = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                slugs.append(line.lower())
+    return slugs
+
+
+def highest_severity(reports):
+    worst = -1
+    for r in reports:
+        for item in r.get("vulnerabilities", []) + r.get("misconfigurations", []):
+            worst = max(worst, SEVERITY_ORDER.get(item.get("severity"), 0))
+    return worst
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="wpaudit",
@@ -506,6 +599,28 @@ def main(argv=None):
     p.add_argument("--html", metavar="FILE", help="write an HTML report to FILE")
     p.add_argument("--db", default=DATA_FILE, help="vulnerability database JSON (default: data/vulnerabilities.json)")
     p.add_argument("--no-config", action="store_true", help="skip misconfiguration checks")
+
+    enum = p.add_argument_group("enumeration")
+    enum.add_argument("-e", "--enumerate", action="store_true",
+                      help="aggressively probe bundled lists of popular plugins/themes "
+                           "(finds components not referenced in the page)")
+    enum.add_argument("--plugin-wordlist", metavar="FILE",
+                      help="custom plugin slug list (implies --enumerate for plugins)")
+    enum.add_argument("--theme-wordlist", metavar="FILE",
+                      help="custom theme slug list (implies --enumerate for themes)")
+
+    online = p.add_argument_group("online vulnerability data")
+    online.add_argument("--online", action="store_true",
+                        help="look up detected versions against a live vulnerability source")
+    online.add_argument("--source", choices=sorted(vulnfeed.SOURCES), default="wpscan",
+                        help="online source (default: wpscan)")
+    online.add_argument("--api-key", default=os.environ.get("WPSCAN_API_KEY"),
+                        help="API key for the source (or WPSCAN_API_KEY env var)")
+    online.add_argument("--update-db", action="store_true",
+                        help="with --online, write fetched data back into the local --db file")
+
+    p.add_argument("--fail-on", choices=sorted(SEVERITY_ORDER), metavar="SEVERITY",
+                   help="exit 2 if any finding is at least this severe (for CI)")
     p.add_argument("-t", "--timeout", type=float, default=10, help="request timeout (default 10)")
     p.add_argument("-w", "--workers", type=int, default=5, help="sites in parallel (default 5)")
     p.add_argument("-k", "--insecure", action="store_true", help="don't verify TLS certificates")
@@ -526,13 +641,34 @@ def main(argv=None):
         p.print_help()
         return 2
 
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    plugin_wl = theme_wl = None
+    if args.enumerate or args.plugin_wordlist:
+        plugin_wl = _load_wordlist(args.plugin_wordlist or os.path.join(data_dir, "plugins_popular.txt"))
+    if args.enumerate or args.theme_wordlist:
+        theme_wl = _load_wordlist(args.theme_wordlist or os.path.join(data_dir, "themes_popular.txt"))
+
     db = load_vuln_db(args.db)
     fetcher = wpcheck.Fetcher(args.timeout, args.user_agent, args.insecure)
 
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         reports = list(ex.map(
-            lambda u: audit_site(u, fetcher, db, do_config=not args.no_config), urls))
+            lambda u: audit_site(u, fetcher, db, do_config=not args.no_config,
+                                 plugin_wordlist=plugin_wl, theme_wordlist=theme_wl), urls))
+
+    if args.online:
+        try:
+            source = vulnfeed.make_source(args.source, fetcher, args.api_key)
+            added = enrich_db_online(db, source, reports,
+                                     cache_path=args.db if args.update_db else None)
+            for r in reports:
+                rematch(r, db)
+            print(f"online source '{args.source}': merged {added} vulnerability entr"
+                  f"{'y' if added == 1 else 'ies'}", file=sys.stderr)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
 
     if args.html:
         with open(args.html, "w", encoding="utf-8") as fh:
@@ -546,6 +682,8 @@ def main(argv=None):
         for r in reports:
             print_text(r, on)
 
+    if args.fail_on is not None and highest_severity(reports) >= SEVERITY_ORDER[args.fail_on]:
+        return 2
     return 0 if all(r["reachable"] for r in reports) else 1
 
 

@@ -125,9 +125,46 @@ python3 wpaudit.py -f sites.txt --json > audit.json
 What it does:
 
 - **Version detection** — WordPress + PHP, reusing `wpcheck.py`.
-- **Plugin & theme enumeration** — finds slugs referenced in the page, then reads each plugin's `readme.txt` (`Stable tag:`) and each theme's `style.css` (`Version:`) for the installed version. Most real-world WordPress vulnerabilities live in plugins, so this is the big one.
+- **Plugin & theme enumeration** — finds slugs referenced in the page, then reads each plugin's `readme.txt` (`Stable tag:`) and each theme's `style.css` (`Version:`) for the installed version. With `-e / --enumerate` it also probes bundled lists of popular plugins/themes, so it finds components that aren't referenced anywhere in the HTML (aggressive hits are marked `*`). Most real-world WordPress vulnerabilities live in plugins, so this is the big one.
 - **Misconfiguration / exposure checks** — accessible `wp-config.php` backups, `.env`, exposed `.git`, `debug.log`, directory listing on `/wp-content/uploads/`, user enumeration via `/wp-json/wp/v2/users`, XML-RPC enabled, `readme.html`, and missing security headers (CSP, HSTS, X-Frame-Options, …).
-- **Vulnerability matching** — compares each detected version against a local database (`data/vulnerabilities.json`) and lists matching CVEs with severity and the version they were fixed in.
+- **Vulnerability matching** — compares each detected version against a database and lists matching CVEs with severity and the version they were fixed in. Works offline against `data/vulnerabilities.json`, or against a **live source** with `--online`.
+
+### Aggressive enumeration
+
+```bash
+# probe ~140 popular plugins and ~45 popular themes, not just what's in the HTML
+python3 wpaudit.py example.com -e
+
+# use your own slug lists
+python3 wpaudit.py example.com --plugin-wordlist my-plugins.txt --theme-wordlist my-themes.txt
+```
+
+A wordlist hit is only reported when its `readme.txt` / `style.css` actually confirms the component is installed, so you don't get false positives.
+
+### Live vulnerability data (closing the gap to WPScan)
+
+The detection logic here is comparable to WPScan's; WPScan's real edge is its continuously-updated vulnerability feed. `--online` lets wpaudit query a live source for exactly the components it found:
+
+```bash
+# WPScan API (free key, ~25 lookups/day): https://wpscan.com/api
+export WPSCAN_API_KEY=xxxxxxxx
+python3 wpaudit.py example.com -e --online
+
+# keyless, best-effort source
+python3 wpaudit.py example.com -e --online --source wpvulnerability
+
+# cache the fetched data into the local DB for later offline runs
+python3 wpaudit.py example.com -e --online --update-db
+```
+
+Only the detected components are looked up (one request each), so a free WPScan key goes a long way. Fetched entries are merged into the in-memory database (and written back with `--update-db`), then matched like any local entry.
+
+### CI usage
+
+```bash
+# non-zero exit (2) if anything high or worse is found — fails the pipeline
+python3 wpaudit.py example.com -e --online --fail-on high --json > audit.json
+```
 
 ### The vulnerability database
 
