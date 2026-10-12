@@ -106,6 +106,57 @@ If the PHP version is hidden but the WordPress version is known, the tool shows 
 }
 ```
 
+
+## wpaudit — security audit (read-only)
+
+`wpaudit.py` extends the version checker into a small, **read-only** WordPress security auditor, in the spirit of WPScan's detection side. It only sends ordinary GET requests (the same a browser makes). It does **not** log in, guess passwords, brute-force, exploit, or change anything — it reads publicly available information and reports it. Use it only on sites you own or are authorized to test.
+
+```bash
+# text report
+python3 wpaudit.py example.com
+
+# nice HTML report you can hand to a client
+python3 wpaudit.py example.com --html report.html
+
+# audit a whole list and save JSON
+python3 wpaudit.py -f sites.txt --json > audit.json
+```
+
+What it does:
+
+- **Version detection** — WordPress + PHP, reusing `wpcheck.py`.
+- **Plugin & theme enumeration** — finds slugs referenced in the page, then reads each plugin's `readme.txt` (`Stable tag:`) and each theme's `style.css` (`Version:`) for the installed version. Most real-world WordPress vulnerabilities live in plugins, so this is the big one.
+- **Misconfiguration / exposure checks** — accessible `wp-config.php` backups, `.env`, exposed `.git`, `debug.log`, directory listing on `/wp-content/uploads/`, user enumeration via `/wp-json/wp/v2/users`, XML-RPC enabled, `readme.html`, and missing security headers (CSP, HSTS, X-Frame-Options, …).
+- **Vulnerability matching** — compares each detected version against a local database (`data/vulnerabilities.json`) and lists matching CVEs with severity and the version they were fixed in.
+
+### The vulnerability database
+
+Matching is only as good as the data behind it. `data/vulnerabilities.json` ships with a **small sample** (a few real historical issues) just to show the format — it is **not** a complete or current feed. Keep it up to date yourself, or regenerate it from a public source such as the WPScan API or wpvulnerability.net.
+
+Format:
+
+```json
+{
+  "core": [
+    { "id": "CVE-2023-2745", "title": "…", "severity": "medium", "fixed_in": "6.2.1" }
+  ],
+  "plugins": {
+    "contact-form-7": [
+      { "id": "CVE-2020-35489", "title": "…", "severity": "critical", "fixed_in": "5.3.2" }
+    ]
+  },
+  "themes": {}
+}
+```
+
+A component at version `V` is reported when `introduced <= V < fixed_in`. You can use `max_affected` (inclusive) instead of `fixed_in`. Severity is one of `critical`, `high`, `medium`, `low`, `info`.
+
+> **Note on results:** a version match is *indicative*, not proof. A plugin may be patched by a backport, protected by a WAF, or not actually running the vulnerable code path. Always confirm findings manually.
+
+### Scope and ethics
+
+This tool is for defensive auditing of your own or authorized sites. It intentionally does **not** include exploitation, password attacks, WAF evasion, or mass-scanning of arbitrary targets — it detects and reports, it does not break in.
+
 ## Legal
 
 Use the tool only on your own sites, client sites, or sites you are allowed to check. It reads only publicly available information, but you are responsible for how you use it.

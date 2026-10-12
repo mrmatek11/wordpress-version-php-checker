@@ -1,0 +1,47 @@
+{
+  "_meta": {
+    "schema": 1,
+    "updated": "2026-10-12",
+    "note": "SAMPLE/STARTER data. These are a handful of real, publicly disclosed historical issues included only to show the format and prove matching works. This file is NOT a complete or current vulnerability feed. Keep it up to date yourself, or refresh it from a public source (e.g. the WPScan API or wpvulnerability.net) before relying on the results.",
+    "matching": "A component at version V is reported when introduced <= V < fixed_in. 'max_affected' (inclusive) may be used instead of 'fixed_in'. Severity is one of: critical, high, medium, low, info."
+  },
+  "core": [
+    {
+      "id": "CVE-2023-2745",
+      "title": "Directory traversal / information disclosure in block themes",
+      "severity": "medium",
+      "fixed_in": "6.2.1",
+      "references": ["https://wordpress.org/news/2023/05/wordpress-6-2-1-maintenance-security-release/"]
+    }
+  ],
+  "plugins": {
+    "contact-form-7": [
+      {
+        "id": "CVE-2020-35489",
+        "title": "Unrestricted file upload",
+        "severity": "critical",
+        "fixed_in": "5.3.2",
+        "references": ["https://wpscan.com/vulnerability/", "https://nvd.nist.gov/vuln/detail/CVE-2020-35489"]
+      }
+    ],
+    "elementor": [
+      {
+        "id": "CVE-2022-29455",
+        "title": "DOM-based reflected XSS",
+        "severity": "high",
+        "fixed_in": "3.5.6",
+        "references": ["https://nvd.nist.gov/vuln/detail/CVE-2022-29455"]
+      }
+    ],
+    "wp-file-manager": [
+      {
+        "id": "CVE-2020-25213",
+        "title": "Remote code execution via unauthenticated file upload",
+        "severity": "critical",
+        "fixed_in": "6.9",
+        "references": ["https://nvd.nist.gov/vuln/detail/CVE-2020-25213"]
+      }
+    ]
+  },
+  "themes": {}
+}
